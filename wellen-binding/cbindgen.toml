@@ -1,0 +1,7 @@
+language = "C"
+include_version = true
+no_includes = false
+
+[parse]
+parse_deps = false
+clean = true
