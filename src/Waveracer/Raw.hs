@@ -1,6 +1,6 @@
 module Waveracer.Raw where
 
--- (Waveform, VarRef, loadFile, lookupSignal, loadSignals, getTimes, getSignal)
+-- (Waveform, Signal, loadFile, lookupSignal, loadSignals, getTimes, getSignal)
 
 import Control.Monad (forM, void)
 import Data.Bits
@@ -19,15 +19,35 @@ import Foreign.Marshal.Alloc (finalizerFree)
 import Foreign.Ptr
 import GHC.Float (castWord64ToDouble)
 import System.Mem.Weak
+import Data.Foldable (toList)
+import qualified Data.Vector.Storable as VS
+
+foreign import ccall safe "wellen-binding.h load_file" loadFileRaw :: CString -> IO (Ptr Waveform)
+foreign import ccall safe "wellen-binding.h load_vars" loadVarsRaw :: Ptr Waveform -> Ptr CUIntPtr -> CUIntPtr -> IO ()
+foreign import ccall unsafe "wellen-binding.h unload_vars" unloadVarsRaw :: Ptr Waveform -> Ptr CUIntPtr -> CUIntPtr -> IO ()
+foreign import ccall unsafe "wellen-binding.h lookup_var" lookupVarRaw :: Ptr Waveform -> CString -> IO (CIntPtr)
+foreign import ccall unsafe "wellen-binding.h get_var" getVarRaw :: Ptr Waveform -> CUIntPtr -> Word32 -> IO (Ptr (SignalResult))
+foreign import ccall unsafe "wellen-binding.h get_times" getTimesRaw :: Ptr Waveform -> IO (Ptr (CSlice Word64))
 
 newtype Waveform = Waveform (ForeignPtr Waveform)
 
 newtype VarRef = VarRef CUIntPtr deriving (Eq, Show, Ord)
 
+newtype Signal = Signal VarRef deriving (Eq, Show, Ord)
+
+newtype TimeIndex = TimeIndex Int deriving (Eq, Show, Ord)
+
 data CSlice a = CSlice
   { csPtr :: Ptr a,
     csLength :: CUIntPtr
   }
+data SignalResult = SignalResult
+  { signalType :: CIntPtr,
+    word :: Word64,
+    bytes :: Ptr Word8,
+    length :: CUIntPtr
+  }
+  deriving (Show)
 
 instance (Storable a) => Storable (CSlice a) where
   sizeOf _ = sizeOf (undefined :: Ptr a) + sizeOf (undefined :: CUIntPtr)
@@ -40,66 +60,92 @@ instance (Storable a) => Storable (CSlice a) where
     pokeByteOff ptr 0 p
     pokeByteOff ptr (sizeOf (undefined :: Ptr a)) l
 
-foreign import ccall "wellen-binding.h load_file" loadFileRaw :: CString -> IO (Ptr Waveform)
-
-loadFile :: String -> IO Waveform
+loadFile :: FilePath -> IO Waveform
 loadFile str = do
   withCString str $ \cString -> do
     waveformPtr <- loadFileRaw cString
-    Waveform <$> newForeignPtr finalizerFree waveformPtr
+    Waveform <$> newForeignPtr freeWaveformRaw waveformPtr
 
-foreign import ccall "wellen-binding.h load_signals" loadSignalsRaw :: Ptr Waveform -> Ptr CUIntPtr -> CUIntPtr -> IO ()
-
-foreign import ccall "wellen-binding.h unload_signals" unloadSignalsRaw :: Ptr Waveform -> Ptr CUIntPtr -> CUIntPtr -> IO ()
-
-loadSignals :: Waveform -> [VarRef] -> IO ()
-loadSignals waveform@(Waveform fPtr) signals = do
+loadVars :: Waveform -> [VarRef] -> IO ()
+loadVars (Waveform fPtr) signals = do
   let count = length signals
   allocaArray count $ \signalsPtr -> do
     void $ forM (zip [0 ..] signals) $ \(offset, ref@(VarRef cInt)) -> do
-      addFinalizer ref (unloadSignals waveform [ref])
       pokeByteOff signalsPtr (offset * sizeOf (undefined :: CUIntPtr)) cInt
     withForeignPtr fPtr $ \ptr -> do
-      loadSignalsRaw ptr signalsPtr (fromIntegral count)
+      loadVarsRaw ptr signalsPtr (fromIntegral count)
 
-unloadSignals :: Waveform -> [VarRef] -> IO ()
-unloadSignals (Waveform fPtr) signals = do
+unloadVars :: Waveform -> [VarRef] -> IO ()
+unloadVars (Waveform fPtr) signals = do
   let count = length signals
   allocaArray count $ \signalsPtr -> do
+    putStr "Unloading: "
+    print signals
     void $ forM (zip [0 ..] signals) $ \(offset, (VarRef cInt)) -> do
-      poke (signalsPtr `plusPtr` offset) cInt
+      pokeByteOff signalsPtr (offset * sizeOf (undefined :: CUIntPtr)) cInt
     withForeignPtr fPtr $ \ptr -> do
-      unloadSignalsRaw ptr signalsPtr (fromIntegral count)
+      unloadVarsRaw ptr signalsPtr (fromIntegral count)
+    void $ putStrLn "Unloading done"
 
-foreign import ccall "wellen-binding.h lookup_signal" lookupSignalRaw :: Ptr Waveform -> CString -> IO (CIntPtr)
+loadSignals :: (Traversable t) => Waveform -> t String -> IO (Maybe (t Signal))
+loadSignals waveform names = do
+  maybeRefs <- for names $ \name -> do
+    lookupVar waveform name
+  case sequence maybeRefs of
+    Just refs -> do
+      loadVars waveform (toList refs)
+      pure $ Just $ Signal <$> refs
+    Nothing -> pure Nothing
 
-lookupSignal :: Waveform -> String -> IO (Maybe VarRef)
-lookupSignal (Waveform fPtr) name = do
+
+
+lookupVar :: Waveform -> String -> IO (Maybe VarRef)
+lookupVar (Waveform fPtr) name = do
   let count = length name
   withCString name $ \cString -> do
     withForeignPtr fPtr $ \ptr -> do
-      cInt <- lookupSignalRaw ptr cString
+      cInt <- lookupVarRaw ptr cString
       pure $
         if cInt >= 0
           then Just $ VarRef (fromIntegral cInt)
           else Nothing
 
-foreign import ccall "wellen-binding.h get_times" getTimesRaw :: Ptr Waveform -> IO (Ptr (CSlice Word64))
+foreign import ccall "wrapper"
+  mkFunPtr :: IO () -> IO (FunPtr (IO ()))
+
+foreign import ccall "&free_waveform"
+  freeWaveformRaw :: FunPtr (Ptr Waveform -> IO ())
 
 getTimes :: Waveform -> IO [Word64]
 getTimes (Waveform fPtr) = do
   withForeignPtr fPtr $ \ptr -> do
     CSlice times count <- getTimesRaw ptr >>= peek
+    -- finalizer <- mkFunPtr (touchForeignPtr fPtr)
+    -- timesFPtr <- newForeignPtr finalizer times
+    -- pure $ VS.unsafeFromForeignPtr0 timesFPtr (fromIntegral count)
     for [0 .. count - 1] $ \i -> do
       peekByteOff times (fromIntegral i * sizeOf (undefined :: Word64))
 
-data SignalResult = SignalResult
-  { signalType :: CIntPtr,
-    word :: Word64,
-    bytes :: Ptr Word8,
-    length :: CUIntPtr
-  }
-  deriving (Show)
+getTimeIndices :: Waveform -> IO [TimeIndex]
+getTimeIndices waveform = do
+  TimeIndexRange (TimeIndex min) (TimeIndex max) <- getTimeIndexRange waveform
+  pure $ TimeIndex <$> [min .. max]
+
+
+getTimeIndexRange :: Waveform -> IO TimeIndexRange
+getTimeIndexRange (Waveform fPtr) = do
+  withForeignPtr fPtr $ \ptr -> do
+    CSlice _ count <- getTimesRaw ptr >>= peek
+    pure $ TimeIndexRange (TimeIndex 0) (TimeIndex (fromIntegral count))
+
+data TimeIndexRange = TimeIndexRange {
+  min :: TimeIndex,
+  max :: TimeIndex
+} deriving (Eq, Show, Ord)
+
+stepTimeIndex :: TimeIndexRange -> TimeIndex -> Int -> TimeIndex
+stepTimeIndex (TimeIndexRange (TimeIndex minTi) (TimeIndex maxTi)) (TimeIndex ti) s =
+  TimeIndex $ max minTi $ min maxTi (ti + s)
 
 instance Storable SignalResult where
   sizeOf _ =
@@ -122,7 +168,6 @@ instance Storable SignalResult where
     pokeByteOff ptr (sizeOf (undefined :: CIntPtr) + sizeOf (undefined :: Word64)) b
     pokeByteOff ptr (sizeOf (undefined :: CIntPtr) + sizeOf (undefined :: Word64) + sizeOf (undefined :: Ptr Word8)) l
 
-foreign import ccall "wellen-binding.h get_signal" getSignalRaw :: Ptr Waveform -> CUIntPtr -> Word32 -> IO (Ptr (SignalResult))
 
 data SignalValue
   = EmptyValue
@@ -133,6 +178,8 @@ data SignalValue
   | RealValue Double
   deriving (Eq, Ord)
 
+-- TODO: wellen does some special handling of the first byte
+-- Maybe there is some special situation which can happen
 instance Show SignalValue where
   show EmptyValue = ""
   show (TwoValues bs count) = foldr (\i s -> makeTwoChar i : s) "" [0 .. count - 1]
@@ -153,11 +200,13 @@ instance Show SignalValue where
         let word = BS.index bs (i `quot` 2)
             offset = 4 * (i `mod` 2)
          in nineStateLookup V.! fromIntegral (shiftR word offset .&. 0b1111)
+  show (StringValue str) = show str
+  show (RealValue value) = show value
 
-getSignal :: Waveform -> VarRef -> Int -> IO SignalValue
-getSignal (Waveform fPtr) (VarRef ref) timeIndex = do
+getSignal :: Waveform -> Signal -> TimeIndex -> IO SignalValue
+getSignal (Waveform fPtr) (Signal (VarRef ref)) (TimeIndex timeIndex) = do
   withForeignPtr fPtr $ \ptr -> do
-    SignalResult signalType word dataPtr count <- getSignalRaw ptr ref (fromIntegral timeIndex) >>= peek
+    SignalResult signalType word dataPtr count <- getVarRaw ptr ref (fromIntegral timeIndex) >>= peek
     case signalType of
       -1 -> pure EmptyValue
       0 -> do
@@ -186,7 +235,7 @@ nineStateLookup = V.fromList "01xzhuwl-"
 
 -- Experiments show that loading signals one by one is extremely slow and impractical for real world usecases
 test1 :: CUIntPtr -> IO ()
-test1 x = loadFile "/home/simon/Downloads/ics-edu-rv32i-sc-new-01b6f7e339eb.fst" >>= \w -> Waveracer.Raw.loadSignals w (VarRef <$> [5 .. x])
+test1 x = loadFile "/home/simon/Downloads/ics-edu-rv32i-sc-new-01b6f7e339eb.fst" >>= \w -> loadVars w (VarRef <$> [5 .. x])
 
 test2 :: CUIntPtr -> IO [()]
-test2 x = loadFile "/home/simon/Downloads/ics-edu-rv32i-sc-new-01b6f7e339eb.fst" >>= \w -> traverse (\i -> Waveracer.Raw.loadSignals w ([VarRef i])) [5 .. x]
+test2 x = loadFile "/home/simon/Downloads/ics-edu-rv32i-sc-new-01b6f7e339eb.fst" >>= \w -> traverse (\i -> loadVars w ([VarRef i])) [5 .. x]

@@ -1,5 +1,5 @@
-use std::{ffi::*, panic, ptr};
-use wellen::{SignalRef, SignalValue, VarRef, simple::*};
+use std::{ffi::*, ops::Deref, panic, ptr};
+use wellen::{Hierarchy, SignalRef, SignalValue, Var, VarRef, simple::*};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn load_file(c_str: *const c_char) -> *mut c_void {
@@ -33,7 +33,14 @@ pub extern "C" fn load_file(c_str: *const c_char) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn load_signals(waveform_ptr: *mut c_void, vars_ptr: *const usize, count: usize) {
+pub extern "C" fn free_waveform(waveform_ptr: *mut c_void) {
+    unsafe {
+        drop(Box::from_raw(waveform_ptr));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn load_vars(waveform_ptr: *mut c_void, vars_ptr: *const usize, count: usize) {
     unsafe {
         let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
         let hierarchy = waveform.hierarchy();
@@ -51,20 +58,37 @@ pub extern "C" fn load_signals(waveform_ptr: *mut c_void, vars_ptr: *const usize
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn unload_signals(waveform_ptr: *mut c_void, vars_ptr: *const usize, count: usize) {
+pub extern "C" fn unload_vars(waveform_ptr: *mut c_void, vars_ptr: *const usize, count: usize) {
     unsafe {
         let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
         let hierarchy = waveform.hierarchy();
 
-        let vars = std::slice::from_raw_parts(vars_ptr, count);
+        assert_eq!(vars_ptr as usize % std::mem::align_of::<usize>(), 0);
+        assert!(!vars_ptr.is_null());
 
-        let vec: Vec<SignalRef> = vars
+        print!("Rust unloading: ");
+        let vars = std::slice::from_raw_parts(vars_ptr, count);
+        println!("{:?}", vars);
+
+        for x in vars {
+            println!("{:?}", *x);
+        }
+        println!("loop");
+
+        // let x = hierarchy.vars().next();
+
+        let vec: Vec<Var> = vars
             .iter()
-            .filter_map(|i| VarRef::from_index(*i))
-            .map(|var_ref| hierarchy[var_ref].signal_ref())
+            .filter_map(|i| {
+                let x = *i;
+                println!("FM: {x}");
+                println!("FM2: {:?}", VarRef::from_index(x));
+                VarRef::from_index(x)
+            })
+            .map(|var_ref| hierarchy[var_ref].clone())
             .collect();
 
-        waveform.unload_signals(vec.as_slice());
+        // waveform.unload_signals(vec.as_slice());
     }
 }
 
@@ -92,7 +116,7 @@ pub struct CSlice<S> {
 // }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn lookup_signal(waveform_ptr: *mut c_void, name_ptr: *const c_char) -> isize {
+pub extern "C" fn lookup_var(waveform_ptr: *mut c_void, name_ptr: *const c_char) -> isize {
     unsafe {
         let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
         let hierarchy = waveform.hierarchy();
@@ -141,7 +165,7 @@ pub struct SignalResult {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn get_signal(
+pub extern "C" fn get_var(
     waveform_ptr: *mut c_void,
     var_index: usize,
     time_index: u32,
