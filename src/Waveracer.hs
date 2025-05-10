@@ -9,18 +9,20 @@ import Control.Monad.Trans.State
 import Data.Coerce (coerce)
 import Data.Foldable (toList)
 import Data.IORef
+import Data.Map qualified as M
 import Data.Maybe
-import Data.Sequence qualified as S
+import Data.Set qualified as S
 import Data.Text qualified as T
 import Data.Traversable
+import Debug.Trace
 import GHC.Generics
 import System.Mem
 import Waveracer.Raw
 
 data TraceEnv = TraceEnv
   { waveform :: Waveform,
-    timeIndices :: [TimeIndex],
-    queuedVars :: IORef (S.Seq VarRef)
+    timeIndices :: S.Set TimeIndex,
+    queuedVars :: IORef (S.Set VarRef)
   }
 
 newtype Trace a = Trace (ReaderT TraceEnv IO a) deriving (Functor, Applicative, Monad, MonadIO, MonadFail)
@@ -30,7 +32,7 @@ newtype Inspect a = Inspect (ReaderT TimeIndex Trace a) deriving (Functor, Appli
 getWaveformT :: Trace Waveform
 getWaveformT = (.waveform) <$> Trace ask
 
-getTimeIndicesT :: Trace [TimeIndex]
+getTimeIndicesT :: Trace (S.Set TimeIndex)
 getTimeIndicesT = (.timeIndices) <$> Trace ask
 
 getTimeIndexI :: Inspect TimeIndex
@@ -47,7 +49,7 @@ getWaveformI :: Inspect Waveform
 getWaveformI = Inspect $ lift getWaveformT
 
 sampleAt :: [TimeIndex] -> Trace a -> Trace a
-sampleAt indices (Trace m) = Trace $ local (\env -> env {timeIndices = indices}) m
+sampleAt indices (Trace m) = Trace $ local (\env -> env {timeIndices = S.fromList indices}) m
 
 sampleOn :: Inspect Bool -> Trace a -> Trace a
 sampleOn inspect trace = do
@@ -58,19 +60,25 @@ runInspect :: Inspect a -> Trace [a]
 runInspect (Inspect m) = do
   timeIndices <- getTimeIndicesT
   loadQueue
-  traverse (runReaderT m) timeIndices
+  traverse (runReaderT m) $ S.toAscList timeIndices
 
 findIndices :: Inspect Bool -> Trace [TimeIndex]
-findIndices (Inspect m) = do
-  indices <- getTimeIndicesT
-  boolIndices <- traverse (\index -> runReaderT m index) indices
+findIndices inspectBool = do
+  indices <- S.toAscList <$> getTimeIndicesT
+  boolIndices <- runInspect inspectBool
   pure $ fmap snd (filter fst (zip boolIndices indices))
 
 runTrace :: Waveform -> Trace a -> IO a
 runTrace waveform (Trace m) = do
   timeIndices <- getTimeIndices waveform
   queueRef <- newIORef S.empty
-  runReaderT m (TraceEnv waveform timeIndices queueRef)
+  runReaderT m (TraceEnv waveform (S.fromList timeIndices) queueRef)
+
+(@+) :: Signal -> Int -> Signal
+(@+) (Signal offset ref) plus = Signal (plus + offset) ref
+
+(@-) :: Signal -> Int -> Signal
+(@-) (Signal offset ref) plus = Signal (plus - offset) ref
 
 -- newtype Load a = Load (ReaderT Waveform (StateT (S.Seq VarRef) (ExceptT String IO)) a) deriving (Functor, Applicative, Monad, MonadIO, MonadFail)
 
@@ -80,43 +88,40 @@ load string = do
   maybeVarRef <- liftIO $ lookupVar env.waveform string
   case maybeVarRef of
     Just a -> do
-      liftIO $ modifyIORef' env.queuedVars (S.|> a)
-      pure $ Signal a
+      liftIO $ modifyIORef' env.queuedVars (S.insert a)
+      pure $ Signal 0 a
     Nothing -> fail $ "Signal " ++ string ++ " not found"
 
 loadMany :: (Traversable t) => t String -> Trace (t Signal)
 loadMany = traverse load
 
+loadAsMap :: [String] -> Trace (M.Map String Signal)
+loadAsMap strings = do
+  signals <- loadMany strings
+  pure $ M.fromList $ zip strings signals
+
 inspect :: Signal -> Inspect SignalValue
 inspect signal = do
   waveform <- getWaveformI
   ti <- getTimeIndexI
-  liftIO $ getSignal waveform signal ti
+  indices <- Inspect $ lift $ getTimeIndicesT
+  liftIO $ getSignal waveform signal ti indices 
 
 testNew :: IO ()
 testNew = do
   wf <- loadFile "/home/simon/Downloads/ics-edu-rv32i-sc-2c8950d9a30b.vcd"
   runTrace wf $ do
+    instr <- load "testbench.instr"
     clk <- load "testbench.dut.clk"
-    aluSrc <- load "testbench.dut.rvsingle.c.md.alusrc"
-    values <- runInspect $ do
-      clkValue <- inspect clk
-      aluSrcValue <- inspect aluSrc
-      pure (clkValue, aluSrcValue)
-    liftIO $ print values
-  performGC
-  -- wf <- getWaveformT
-  -- liftIO $ unloadVars wf [coerce signal]
-
+    sampleOn ((1 ==) <$> inspect clk) $ do
+      values <- runInspect $ do
+        instrValue <- inspect instr
+        instrValue1 <- inspect (instr @+ 1)
+        pure (instrValue, instrValue1)
+      liftIO $ do
+        print values
   pure ()
 
-test :: IO ()
-test = do
-  wf <- loadFile "/home/simon/Downloads/ics-edu-rv32i-sc-2c8950d9a30b.vcd"
-  Just signals <- loadSignals wf ["testbench.dut.clk"]
-  x <- traverse (getSignal wf (Prelude.head signals)) $ fmap TimeIndex [0 .. 40]
-  print x
-  pure ()
 
 -- data TraceTime
 --   = MicroSeconds Integer
