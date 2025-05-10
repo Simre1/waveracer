@@ -34,6 +34,7 @@ pub extern "C" fn load_file(c_str: *const c_char) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn free_waveform(waveform_ptr: *mut c_void) {
+    println!("Dropping Waveform");
     unsafe {
         drop(Box::from_raw(waveform_ptr));
     }

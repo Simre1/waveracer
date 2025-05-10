@@ -1,13 +1,13 @@
+{-# LANGUAGE RecursiveDo #-}
+
 module Waveracer.Raw where
 
 -- (Waveform, Signal, loadFile, lookupSignal, loadSignals, getTimes, getSignal)
 
 import Control.Monad (forM, void)
 import Data.Bits
-import Data.Bits (Bits (testBit))
 import Data.ByteString qualified as BS
 import Data.ByteString.Unsafe qualified as BS
-import Data.Coerce (coerce)
 import Data.Traversable (for)
 import Data.Vector.Storable qualified as V
 import Data.Word
@@ -15,7 +15,6 @@ import Foreign (Storable (..))
 import Foreign.C
 import Foreign.ForeignPtr
 import Foreign.Marshal (allocaArray)
-import Foreign.Marshal.Alloc (finalizerFree)
 import Foreign.Ptr
 import GHC.Float (castWord64ToDouble)
 import System.Mem.Weak
@@ -31,7 +30,7 @@ foreign import ccall unsafe "wellen-binding.h get_times" getTimesRaw :: Ptr Wave
 
 newtype Waveform = Waveform (ForeignPtr Waveform)
 
-newtype VarRef = VarRef CUIntPtr deriving (Eq, Show, Ord)
+data VarRef = VarRef CUIntPtr deriving (Eq, Show, Ord)
 
 newtype Signal = Signal VarRef deriving (Eq, Show, Ord)
 
@@ -64,13 +63,22 @@ loadFile :: FilePath -> IO Waveform
 loadFile str = do
   withCString str $ \cString -> do
     waveformPtr <- loadFileRaw cString
-    Waveform <$> newForeignPtr freeWaveformRaw waveformPtr
+    -- fin <- mkFunPtr $ \(_ :: Ptr Waveform) -> putStrLn "Cleaning Waveform"
+    fPtr <- newForeignPtr freeWaveformRaw  waveformPtr  
+       
+    -- addForeignPtrFinalizer fin fPtr
+    pure $ Waveform fPtr
 
 loadVars :: Waveform -> [VarRef] -> IO ()
-loadVars (Waveform fPtr) signals = do
+loadVars waveform@(Waveform fPtr) signals = do
   let count = length signals
   allocaArray count $ \signalsPtr -> do
-    void $ forM (zip [0 ..] signals) $ \(offset, ref@(VarRef cInt)) -> do
+    void $ forM (zip [0 ..] signals) $ \(offset, ref@(VarRef cInt)) -> mdo
+      weak <- mkWeak ref waveform $ Just $ do
+        maybeWaveform <- deRefWeak weak 
+        case maybeWaveform of
+          Just aliveWaveform -> unloadVars aliveWaveform [ref]
+          Nothing -> pure ()
       pokeByteOff signalsPtr (offset * sizeOf (undefined :: CUIntPtr)) cInt
     withForeignPtr fPtr $ \ptr -> do
       loadVarsRaw ptr signalsPtr (fromIntegral count)
@@ -97,8 +105,6 @@ loadSignals waveform names = do
       pure $ Just $ Signal <$> refs
     Nothing -> pure Nothing
 
-
-
 lookupVar :: Waveform -> String -> IO (Maybe VarRef)
 lookupVar (Waveform fPtr) name = do
   let count = length name
@@ -111,10 +117,13 @@ lookupVar (Waveform fPtr) name = do
           else Nothing
 
 foreign import ccall "wrapper"
-  mkFunPtr :: IO () -> IO (FunPtr (IO ()))
+  mkFunPtr :: (Ptr a -> IO ()) -> IO (FunPtr (Ptr a -> IO ()))
 
 foreign import ccall "&free_waveform"
   freeWaveformRaw :: FunPtr (Ptr Waveform -> IO ())
+
+foreign import ccall "free_waveform"
+  freeWaveformRaw2 :: Ptr Waveform -> IO ()
 
 getTimes :: Waveform -> IO [Word64]
 getTimes (Waveform fPtr) = do
