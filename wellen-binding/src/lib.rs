@@ -1,5 +1,5 @@
 use std::{ffi::*, ops::Deref, panic, ptr};
-use wellen::{Hierarchy, SignalRef, SignalValue, Var, VarRef, simple::*};
+use wellen::{Hierarchy, SignalRef, SignalValue, Timescale, TimescaleUnit, Var, VarRef, simple::*};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn load_file(c_str: *const c_char) -> *mut c_void {
@@ -142,6 +142,28 @@ pub extern "C" fn get_times(waveform_ptr: *mut c_void) -> *const CSlice<u64> {
             length: times.len(),
         };
         return Box::into_raw(Box::new(c_slice));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_timescale(waveform_ptr: *mut c_void) -> u64 {
+    unsafe {
+        let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
+        match waveform.hierarchy().timescale() {
+            None => return 0,
+            Some(Timescale { factor, unit }) => {
+                let unit_int = match unit {
+                    TimescaleUnit::FemtoSeconds => 1,
+                    TimescaleUnit::PicoSeconds => 2,
+                    TimescaleUnit::NanoSeconds => 3,
+                    TimescaleUnit::MicroSeconds => 4,
+                    TimescaleUnit::MilliSeconds => 5,
+                    TimescaleUnit::Seconds => 6,
+                    TimescaleUnit::Unknown => 0,
+                };
+                ((factor as u64) << 32) | unit_int
+            }
+        }
     }
 }
 

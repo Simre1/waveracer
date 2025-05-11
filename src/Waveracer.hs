@@ -92,6 +92,12 @@ inspect signal = do
   ti <- getCurrentTimeIndex
   liftIO $ getSignal waveform signal ti 
 
+inspectTime :: Inspect TraceTime
+inspectTime = do
+  waveform <- Inspect $ lift $ getWaveform
+  ti <- getCurrentTimeIndex
+  liftIO $ getTraceTime waveform ti 
+
 testNew :: IO ()
 testNew = do
   wf <- loadFile "/home/simon/Downloads/ics-edu-rv32i-sc-2c8950d9a30b.vcd"
@@ -103,7 +109,8 @@ testNew = do
       values <- runInspect $ do
         instrValue <- inspect instr
         instrValue1 <- inspect instr2 @+ 1
-        pure (instrValue, instrValue1)
+        time <- inspectTime
+        pure (instrValue, instrValue1, time)
       liftIO $ do
         print values
     liftIO performGC

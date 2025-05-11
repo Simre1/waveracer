@@ -5,7 +5,7 @@ module Waveracer.Internal where
 
 -- (Waveform, Signal, loadFile, lookupSignal, loadSignals, getTimes, getSignal)
 
-import Control.Monad (forM, guard, join, void)
+import Control.Monad (forM, guard, join, void, when)
 import Data.Bits
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
@@ -45,6 +45,8 @@ foreign import ccall unsafe "wellen-binding.h get_var" getVarRaw :: Ptr Waveform
 
 foreign import ccall unsafe "wellen-binding.h get_times" getTimesRaw :: Ptr Waveform -> IO (Ptr (CSlice Word64))
 
+foreign import ccall unsafe "wellen-binding.h get_timescale" getTimescaleRaw :: Ptr Waveform -> IO CIntPtr
+
 data Waveform = Waveform
   { fPtr :: ForeignPtr Waveform,
     activeVars :: IORef (M.Map String (Weak VarRef)),
@@ -56,6 +58,31 @@ data VarRef = VarRef CUIntPtr deriving (Eq, Show, Ord)
 data Signal = Signal {varRef :: VarRef} deriving (Eq, Show, Ord)
 
 newtype TimeIndex = TimeIndex Int deriving (Eq, Show, Ord)
+
+data TimeIndexRange = TimeIndexRange
+  { min :: TimeIndex,
+    max :: TimeIndex
+  }
+  deriving (Eq, Show, Ord)
+
+data TimeUnit
+  = FemtoSeconds
+  | PicoSeconds
+  | NanoSeconds
+  | MicroSeconds
+  | MilliSeconds
+  | Seconds
+  | Unknown
+  deriving (Eq, Ord, Show)
+
+data Timescale = Timescale
+  { factor :: Word32,
+    unit :: TimeUnit
+  }
+  deriving (Eq, Ord, Show)
+
+data TraceTime = TraceTime {time :: Word64, scale :: Timescale}
+  deriving (Eq, Ord, Show)
 
 data CSlice a = CSlice
   { csPtr :: Ptr a,
@@ -156,6 +183,21 @@ foreign import ccall "&free_waveform"
 foreign import ccall "free_waveform"
   freeWaveformRaw2 :: Ptr Waveform -> IO ()
 
+getTraceTime :: Waveform -> TimeIndex -> IO TraceTime
+getTraceTime waveform (TimeIndex ti) = do
+  scale <- getTimescale waveform
+  withForeignPtr waveform.fPtr $ \ptr -> do
+    CSlice times count <- getTimesRaw ptr >>= peek
+    print (ti, count)
+    when (ti >= fromIntegral count) $
+      fail "That time index is too great"
+    time <- peekByteOff times (ti * sizeOf (undefined :: Word64))
+    pure $ TraceTime time scale
+
+-- finalizer <- mkFunPtr (touchForeignPtr fPtr)
+-- timesFPtr <- newForeignPtr finalizer times
+-- pure $ VS.unsafeFromForeignPtr0 timesFPtr (fromIntegral count)
+
 getTimes :: Waveform -> IO [Word64]
 getTimes waveform = do
   withForeignPtr waveform.fPtr $ \ptr -> do
@@ -166,6 +208,22 @@ getTimes waveform = do
     for [0 .. count - 1] $ \i -> do
       peekByteOff times (fromIntegral i * sizeOf (undefined :: Word64))
 
+getTimescale :: Waveform -> IO Timescale
+getTimescale waveform =
+  withForeignPtr waveform.fPtr $ \ptr -> do
+    timescale_int <- getTimescaleRaw ptr
+    let factor = fromIntegral $ shiftR timescale_int 32
+        unit_int = timescale_int .&. 0xFFFFFFFF
+        unit = case unit_int of
+          1 -> FemtoSeconds
+          2 -> PicoSeconds
+          3 -> NanoSeconds
+          4 -> MicroSeconds
+          5 -> MilliSeconds
+          6 -> Seconds
+          _ -> Unknown
+    pure $ Timescale {unit, factor}
+
 getTimeIndices :: Waveform -> IO [TimeIndex]
 getTimeIndices waveform = do
   TimeIndexRange (TimeIndex min) (TimeIndex max) <- getTimeIndexRange waveform
@@ -175,13 +233,7 @@ getTimeIndexRange :: Waveform -> IO TimeIndexRange
 getTimeIndexRange waveform = do
   withForeignPtr waveform.fPtr $ \ptr -> do
     CSlice _ count <- getTimesRaw ptr >>= peek
-    pure $ TimeIndexRange (TimeIndex 0) (TimeIndex (fromIntegral count))
-
-data TimeIndexRange = TimeIndexRange
-  { min :: TimeIndex,
-    max :: TimeIndex
-  }
-  deriving (Eq, Show, Ord)
+    pure $ TimeIndexRange (TimeIndex 0) (TimeIndex (fromIntegral (count - 1)))
 
 stepTimeIndex :: TimeIndexRange -> TimeIndex -> Int -> Maybe TimeIndex
 stepTimeIndex (TimeIndexRange (TimeIndex minTi) (TimeIndex maxTi)) (TimeIndex ti) s = do
@@ -402,24 +454,24 @@ enqueueVar waveform ref = modifyIORef' waveform.loadQueue (S.insert ref)
 
 getSignal :: Waveform -> Signal -> TimeIndex -> IO SignalValue
 getSignal waveform (Signal (VarRef ref)) (TimeIndex rawIndex) =
-      withForeignPtr waveform.fPtr $ \ptr -> do
-        SignalResult signalType word dataPtr count <- getVarRaw ptr ref (fromIntegral rawIndex) >>= peek
-        case signalType of
-          -1 -> pure (ErrorValue "The signal does not have a value yet")
-          0 -> do
-            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
-            pure $ BitsValue Two (fromIntegral word) bs
-          1 -> do
-            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
-            pure $ BitsValue Four (fromIntegral word) bs
-          2 -> do
-            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
-            pure $ BitsValue Nine (fromIntegral word) bs
-          3 -> do
-            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
-            pure $ StringValue bs
-          4 -> pure $ RealValue $ castWord64ToDouble word
-          x -> error $ "Unsupported signal value: " ++ show x
+  withForeignPtr waveform.fPtr $ \ptr -> do
+    SignalResult signalType word dataPtr count <- getVarRaw ptr ref (fromIntegral rawIndex) >>= peek
+    case signalType of
+      -1 -> pure (ErrorValue "The signal does not have a value yet")
+      0 -> do
+        bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
+        pure $ BitsValue Two (fromIntegral word) bs
+      1 -> do
+        bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
+        pure $ BitsValue Four (fromIntegral word) bs
+      2 -> do
+        bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
+        pure $ BitsValue Nine (fromIntegral word) bs
+      3 -> do
+        bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
+        pure $ StringValue bs
+      4 -> pure $ RealValue $ castWord64ToDouble word
+      x -> error $ "Unsupported signal value: " ++ show x
 
 stateLookup :: States -> V.Vector Char
 stateLookup states = V.fromList $ case states of
