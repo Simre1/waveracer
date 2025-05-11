@@ -1,18 +1,22 @@
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE RecursiveDo #-}
 
 module Waveracer.Raw where
 
 -- (Waveform, Signal, loadFile, lookupSignal, loadSignals, getTimes, getSignal)
 
-import Control.Monad (forM, guard, void)
+import Control.Monad (forM, guard, join, void)
 import Data.Bits
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Unsafe qualified as BS
 import Data.Char (intToDigit)
+import Data.Either (partitionEithers)
 import Data.Foldable (toList)
+import Data.IORef
 import Data.Map qualified as M
-import Data.Maybe (fromJust, fromMaybe)
+import Data.Maybe (catMaybes, fromJust, fromMaybe)
+import Data.Ratio
 import Data.Set qualified as S
 import Data.Text.Internal.Read
 import Data.Traversable (for)
@@ -41,7 +45,11 @@ foreign import ccall unsafe "wellen-binding.h get_var" getVarRaw :: Ptr Waveform
 
 foreign import ccall unsafe "wellen-binding.h get_times" getTimesRaw :: Ptr Waveform -> IO (Ptr (CSlice Word64))
 
-newtype Waveform = Waveform (ForeignPtr Waveform)
+data Waveform = Waveform
+  { fPtr :: ForeignPtr Waveform,
+    activeVars :: IORef (M.Map String (Weak VarRef)),
+    loadQueue :: IORef (S.Set VarRef)
+  }
 
 data VarRef = VarRef CUIntPtr deriving (Eq, Show, Ord)
 
@@ -77,56 +85,67 @@ loadFile :: FilePath -> IO Waveform
 loadFile str = do
   withCString str $ \cString -> do
     waveformPtr <- loadFileRaw cString
-    -- fin <- mkFunPtr $ \(_ :: Ptr Waveform) -> putStrLn "Cleaning Waveform"
     fPtr <- newForeignPtr freeWaveformRaw waveformPtr
+    activeSignals <- newIORef M.empty
+    loadQueue <- newIORef S.empty
 
-    -- addForeignPtrFinalizer fin fPtr
-    pure $ Waveform fPtr
+    pure $ Waveform fPtr activeSignals loadQueue
 
 loadVars :: Waveform -> [VarRef] -> IO ()
-loadVars waveform@(Waveform fPtr) signals = do
-  let count = length signals
+loadVars waveform vars = do
+  let count = length vars
   allocaArray count $ \signalsPtr -> do
-    void $ forM (zip [0 ..] signals) $ \(offset, ref@(VarRef cInt)) -> mdo
+    void $ forM (zip [0 ..] vars) $ \(offset, ref@(VarRef cInt)) -> mdo
       weak <- mkWeak ref waveform $ Just $ do
         maybeWaveform <- deRefWeak weak
         case maybeWaveform of
           Just aliveWaveform -> unloadVars aliveWaveform [ref]
           Nothing -> pure ()
       pokeByteOff signalsPtr (offset * sizeOf (undefined :: CUIntPtr)) cInt
-    withForeignPtr fPtr $ \ptr -> do
+    withForeignPtr waveform.fPtr $ \ptr -> do
       loadVarsRaw ptr signalsPtr (fromIntegral count)
 
 unloadVars :: Waveform -> [VarRef] -> IO ()
-unloadVars (Waveform fPtr) signals = do
+unloadVars waveform signals = do
   let count = length signals
   allocaArray count $ \signalsPtr -> do
     void $ forM (zip [0 ..] signals) $ \(offset, (VarRef cInt)) -> do
       pokeByteOff signalsPtr (offset * sizeOf (undefined :: CUIntPtr)) cInt
-    withForeignPtr fPtr $ \ptr -> do
+    withForeignPtr waveform.fPtr $ \ptr -> do
       unloadVarsRaw ptr signalsPtr (fromIntegral count)
     void $ putStrLn "Unloading done"
 
-loadSignals :: (Traversable t) => Waveform -> t String -> IO (Maybe (t Signal))
-loadSignals waveform names = do
-  maybeRefs <- for names $ \name -> do
-    lookupVar waveform name
-  case sequence maybeRefs of
-    Just refs -> do
-      loadVars waveform (toList refs)
-      pure $ Just $ Signal 0 <$> refs
+lookupSignal :: Waveform -> String -> IO (Maybe Signal)
+lookupSignal waveform name = fmap (Signal 0) <$> lookupVar waveform name
+
+lookupActiveVar :: Waveform -> String -> IO (Maybe VarRef)
+lookupActiveVar waveform string = do
+  activeVars <- readIORef waveform.activeVars
+  case M.lookup string activeVars of
     Nothing -> pure Nothing
+    Just weak -> do
+      maybeVar <- deRefWeak weak
+      case maybeVar of
+        Nothing -> do
+          modifyIORef' waveform.activeVars (M.delete string)
+          pure Nothing
+        Just var -> pure $ Just var
 
 lookupVar :: Waveform -> String -> IO (Maybe VarRef)
-lookupVar (Waveform fPtr) name = do
-  let count = length name
-  withCString name $ \cString -> do
-    withForeignPtr fPtr $ \ptr -> do
-      cInt <- lookupVarRaw ptr cString
-      pure $
-        if cInt >= 0
-          then Just $ VarRef (fromIntegral cInt)
-          else Nothing
+lookupVar waveform name = do
+  activeVar <- lookupActiveVar waveform name
+  case activeVar of
+    Just var -> pure $ Just var
+    Nothing -> do
+      withCString name $ \cString -> do
+        withForeignPtr waveform.fPtr $ \ptr -> do
+          cInt <- lookupVarRaw ptr cString
+          if cInt >= 0
+            then do
+              let var = VarRef (fromIntegral cInt)
+              enqueueVar waveform var
+              pure $ Just var
+            else pure Nothing
 
 foreign import ccall "wrapper"
   mkFunPtr :: (Ptr a -> IO ()) -> IO (FunPtr (Ptr a -> IO ()))
@@ -138,8 +157,8 @@ foreign import ccall "free_waveform"
   freeWaveformRaw2 :: Ptr Waveform -> IO ()
 
 getTimes :: Waveform -> IO [Word64]
-getTimes (Waveform fPtr) = do
-  withForeignPtr fPtr $ \ptr -> do
+getTimes waveform = do
+  withForeignPtr waveform.fPtr $ \ptr -> do
     CSlice times count <- getTimesRaw ptr >>= peek
     -- finalizer <- mkFunPtr (touchForeignPtr fPtr)
     -- timesFPtr <- newForeignPtr finalizer times
@@ -153,8 +172,8 @@ getTimeIndices waveform = do
   pure $ TimeIndex <$> [min .. max]
 
 getTimeIndexRange :: Waveform -> IO TimeIndexRange
-getTimeIndexRange (Waveform fPtr) = do
-  withForeignPtr fPtr $ \ptr -> do
+getTimeIndexRange waveform = do
+  withForeignPtr waveform.fPtr $ \ptr -> do
     CSlice _ count <- getTimesRaw ptr >>= peek
     pure $ TimeIndexRange (TimeIndex 0) (TimeIndex (fromIntegral count))
 
@@ -214,37 +233,73 @@ instance Show SignalValue where
 
 instance Num SignalValue where
   fromInteger n = fromJust $ makeBitsValue Two $ showIntAtBase 2 intToDigit n ""
+  sv1 + sv2 = performBinaryOp Plus sv1 sv2
+  sv1 - sv2 = performBinaryOp Minus sv1 sv2
+  sv1 * sv2 = performBinaryOp Multiply sv1 sv2
+  signum sv = performUnaryOp Signum sv
+  negate sv = performUnaryOp Negate sv
+  abs sv = performUnaryOp Abs sv
 
--- (*) = _
--- abs = _
--- signum = _
--- negate = _
+instance Fractional SignalValue where
+  fromRational rational =
+    if denominator rational == 1
+      then fromIntegral (numerator rational)
+      else RealValue (fromRational rational)
+  sv1 / sv2 = performBinaryOp Divide sv1 sv2
 
-data ArithmeticOp = Plus | Minus | Multiply | Divide
+data UnaryOp
+  = Signum
+  | Abs
+  | Negate
 
-execArithmeticOp :: ArithmeticOp -> Either Int Double -> Either Int Double -> Either Int Double
+data BinaryOp
+  = Plus
+  | Minus
+  | Multiply
+  | Divide
+
+execArithmeticOp :: BinaryOp -> Either Int Double -> Either Int Double -> Either Int Double
 execArithmeticOp = undefined
 
 intOrDoubleToSignalValue :: Either Int Double -> SignalValue
 intOrDoubleToSignalValue (Left int) = fromIntegral int
 intOrDoubleToSignalValue (Right double) = RealValue double
 
-performArithmeticOp :: ArithmeticOp -> SignalValue -> SignalValue -> SignalValue
-performArithmeticOp _ (ErrorValue reason) _ = ErrorValue reason
-performArithmeticOp _ _ (ErrorValue reason) = ErrorValue reason
-performArithmeticOp _ (StringValue _) _ = ErrorValue "Cannot perform arithmetic on strings"
-performArithmeticOp _ _ (StringValue _) = ErrorValue "Cannot perform arithmetic on strings"
-performArithmeticOp arop sv1@(BitsValue {}) sv2@(BitsValue {}) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
+performUnaryOp :: UnaryOp -> SignalValue -> SignalValue
+performUnaryOp op (StringValue str) = ErrorValue "Cannot perform arithmetic on strings"
+performUnaryOp op (ErrorValue reason) = (ErrorValue reason)
+performUnaryOp op (RealValue double) = case op of
+  Signum ->
+    if
+      | double > 0 -> 1
+      | double < 0 -> -1
+      | otherwise -> 0
+  Abs -> RealValue (abs double)
+  Negate -> RealValue (negate double)
+performUnaryOp op sv@(BitsValue {}) =
+  fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
+    n <- signalValueToInt sv
+    pure $ fromIntegral $ case op of
+      Signum -> signum n
+      Abs -> abs n
+      Negate -> abs n
+
+performBinaryOp :: BinaryOp -> SignalValue -> SignalValue -> SignalValue
+performBinaryOp _ (ErrorValue reason) _ = ErrorValue reason
+performBinaryOp _ _ (ErrorValue reason) = ErrorValue reason
+performBinaryOp _ (StringValue _) _ = ErrorValue "Cannot perform arithmetic on strings"
+performBinaryOp _ _ (StringValue _) = ErrorValue "Cannot perform arithmetic on strings"
+performBinaryOp arop sv1@(BitsValue {}) sv2@(BitsValue {}) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
   n1 <- signalValueToInt sv1
   n2 <- signalValueToInt sv2
   pure $ intOrDoubleToSignalValue $ execArithmeticOp arop (Left n1) (Left n2)
-performArithmeticOp arop (RealValue n1) sv2@(BitsValue {}) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
+performBinaryOp arop (RealValue n1) sv2@(BitsValue {}) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
   n2 <- signalValueToInt sv2
   pure $ intOrDoubleToSignalValue $ execArithmeticOp arop (Right n1) (Left n2)
-performArithmeticOp arop sv1@(BitsValue {}) (RealValue n2) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
+performBinaryOp arop sv1@(BitsValue {}) (RealValue n2) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
   n1 <- signalValueToInt sv1
   pure $ intOrDoubleToSignalValue $ execArithmeticOp arop (Left n1) (Right n2)
-performArithmeticOp arop (RealValue n1) (RealValue n2) =
+performBinaryOp arop (RealValue n1) (RealValue n2) =
   intOrDoubleToSignalValue $ execArithmeticOp arop (Right n1) (Right n2)
 
 decodeByteString :: States -> Int -> BS.ByteString -> String
@@ -311,12 +366,6 @@ instance Eq SignalValue where
 instance Ord SignalValue where
   sv1 `compare` sv2 = show sv1 `compare` show sv2
 
--- signalValuetoInt :: SignalValue -> Maybe Int
--- signalValuetoInt (sv) = do
---   let bits = show sv
---   guard $ all (\c -> c == '1' || c == '0') bits
---   pure bits
-
 data States = Two | Four | Nine deriving (Eq, Show, Ord)
 
 bitsForDigit :: States -> Int
@@ -343,8 +392,16 @@ isFalse sv = case show sv of
   ('0' : _) -> True
   _ -> False
 
+loadQueuedSignals :: Waveform -> IO ()
+loadQueuedSignals waveform = do
+  queue <- atomicModifyIORef' waveform.loadQueue (\q -> (S.empty, q))
+  loadVars waveform (S.toList queue)
+
+enqueueVar :: Waveform -> VarRef -> IO ()
+enqueueVar waveform ref = modifyIORef' waveform.loadQueue (S.insert ref)
+
 getSignal :: Waveform -> Signal -> TimeIndex -> S.Set TimeIndex -> IO SignalValue
-getSignal waveform@(Waveform fPtr) (Signal offset (VarRef ref)) timeIndex@(TimeIndex rawIndex) indices
+getSignal waveform (Signal offset (VarRef ref)) timeIndex@(TimeIndex rawIndex) indices
   | offset > 0 = case S.lookupGT timeIndex indices of
       Just newTimeIndex -> getSignal waveform (Signal (pred offset) (VarRef ref)) newTimeIndex indices
       Nothing -> pure $ ErrorValue $ "Cannot step forwards for time index " ++ show timeIndex
@@ -352,21 +409,21 @@ getSignal waveform@(Waveform fPtr) (Signal offset (VarRef ref)) timeIndex@(TimeI
       Just newTimeIndex -> getSignal waveform (Signal (succ offset) (VarRef ref)) newTimeIndex indices
       Nothing -> pure $ ErrorValue $ "Cannot step backwards for time index " ++ show timeIndex
   | otherwise = do
-      withForeignPtr fPtr $ \ptr -> do
+      withForeignPtr waveform.fPtr $ \ptr -> do
         SignalResult signalType word dataPtr count <- getVarRaw ptr ref (fromIntegral rawIndex) >>= peek
         case signalType of
           -1 -> pure (ErrorValue "The signal does not have a value yet")
           0 -> do
-            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr fPtr)
+            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
             pure $ BitsValue Two (fromIntegral word) bs
           1 -> do
-            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr fPtr)
+            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
             pure $ BitsValue Four (fromIntegral word) bs
           2 -> do
-            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr fPtr)
+            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
             pure $ BitsValue Nine (fromIntegral word) bs
           3 -> do
-            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr fPtr)
+            bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
             pure $ StringValue bs
           4 -> pure $ RealValue $ castWord64ToDouble word
           x -> error $ "Unsupported signal value: " ++ show x
