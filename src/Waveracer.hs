@@ -1,23 +1,12 @@
-module Waveracer where
+module Waveracer (Waveform, loadFile, Trace, runTrace, Signal, load, loadMany, loadAsMap, (@+), (@-), findIndices, sampleAt, sampleOn, Inspect, runInspect, inspect, SignalValue) where
 
-import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
-import Control.Monad.Trans.Except
 import Control.Monad.Trans.Reader
-import Control.Monad.Trans.State
-import Data.Coerce (coerce)
-import Data.Foldable (toList)
-import Data.IORef
 import Data.Map qualified as M
-import Data.Maybe
 import Data.Set qualified as S
-import Data.Text qualified as T
-import Data.Traversable
-import Debug.Trace
-import GHC.Generics
 import System.Mem
-import Waveracer.Raw
+import Waveracer.Internal
 
 data TraceEnv = TraceEnv
   { waveform :: Waveform,
@@ -28,24 +17,14 @@ newtype Trace a = Trace (ReaderT TraceEnv IO a) deriving (Functor, Applicative, 
 
 newtype Inspect a = Inspect (ReaderT TimeIndex Trace a) deriving (Functor, Applicative, Monad, MonadIO, MonadFail)
 
-getWaveformT :: Trace Waveform
-getWaveformT = (.waveform) <$> Trace ask
+getWaveform :: Trace Waveform
+getWaveform = (.waveform) <$> Trace ask
 
-getTimeIndicesT :: Trace (S.Set TimeIndex)
-getTimeIndicesT = (.timeIndices) <$> Trace ask
+getCurrentTimeIndices :: Trace (S.Set TimeIndex)
+getCurrentTimeIndices = (.timeIndices) <$> Trace ask
 
-getTimeIndexI :: Inspect TimeIndex
-getTimeIndexI = Inspect ask
-
--- loadQueue :: Trace ()
--- loadQueue = do
---   env <- Trace ask
---   queue <- liftIO $ atomicModifyIORef' env.queuedVars (\q -> (S.empty, q))
---   liftIO $ loadVars env.waveform (toList queue)
---   pure ()
-
-getWaveformI :: Inspect Waveform
-getWaveformI = Inspect $ lift getWaveformT
+getCurrentTimeIndex :: Inspect TimeIndex
+getCurrentTimeIndex = Inspect ask
 
 sampleAt :: [TimeIndex] -> Trace a -> Trace a
 sampleAt indices (Trace m) = Trace $ local (\env -> env {timeIndices = S.fromList indices}) m
@@ -57,14 +36,14 @@ sampleOn inspect trace = do
 
 runInspect :: Inspect a -> Trace [a]
 runInspect (Inspect m) = do
-  timeIndices <- getTimeIndicesT
-  waveform <- getWaveformT
+  timeIndices <- getCurrentTimeIndices
+  waveform <- getWaveform
   liftIO $ loadQueuedSignals waveform
   traverse (runReaderT m) $ S.toAscList timeIndices
 
 findIndices :: Inspect Bool -> Trace [TimeIndex]
 findIndices inspectBool = do
-  indices <- S.toAscList <$> getTimeIndicesT
+  indices <- S.toAscList <$> getCurrentTimeIndices
   boolIndices <- runInspect inspectBool
   pure $ fmap snd (filter fst (zip boolIndices indices))
 
@@ -73,13 +52,23 @@ runTrace waveform (Trace m) = do
   timeIndices <- getTimeIndices waveform
   runReaderT m (TraceEnv waveform (S.fromList timeIndices))
 
-(@+) :: Signal -> Int -> Signal
-(@+) (Signal offset ref) plus = Signal (plus + offset) ref
+(@+) :: Inspect SignalValue -> Int -> Inspect SignalValue
+(@+) (Inspect m) offset = do
+  indices <- Inspect $ lift $ getCurrentTimeIndices
+  currentTimeIndex <- getCurrentTimeIndex
+  Inspect $ lift $ go indices currentTimeIndex offset 
+  where
+    go indices timeIndex offset 
+      | offset > 0 = case S.lookupGT timeIndex indices of
+          Just newTimeIndex -> go indices newTimeIndex (pred offset)
+          Nothing -> pure $ ErrorValue $ "Cannot step forwards for time index " ++ show timeIndex
+      | offset < 0 = case S.lookupLT timeIndex indices of
+          Just newTimeIndex -> go indices newTimeIndex (succ offset)
+          Nothing -> pure $ ErrorValue $ "Cannot step backwards for time index " ++ show timeIndex
+      | otherwise = runReaderT m timeIndex
 
-(@-) :: Signal -> Int -> Signal
-(@-) (Signal offset ref) plus = Signal (plus - offset) ref
-
--- newtype Load a = Load (ReaderT Waveform (StateT (S.Seq VarRef) (ExceptT String IO)) a) deriving (Functor, Applicative, Monad, MonadIO, MonadFail)
+(@-) :: Inspect SignalValue -> Int -> Inspect SignalValue
+(@-) inspect offset = inspect @+ (-offset)
 
 load :: String -> Trace Signal
 load string = do
@@ -99,10 +88,9 @@ loadAsMap strings = do
 
 inspect :: Signal -> Inspect SignalValue
 inspect signal = do
-  waveform <- getWaveformI
-  ti <- getTimeIndexI
-  indices <- Inspect $ lift $ getTimeIndicesT
-  liftIO $ getSignal waveform signal ti indices
+  waveform <- Inspect $ lift $ getWaveform
+  ti <- getCurrentTimeIndex
+  liftIO $ getSignal waveform signal ti 
 
 testNew :: IO ()
 testNew = do
@@ -114,7 +102,7 @@ testNew = do
     sampleOn ((1 ==) <$> inspect clk) $ do
       values <- runInspect $ do
         instrValue <- inspect instr
-        instrValue1 <- inspect (instr2 @+ 1)
+        instrValue1 <- inspect instr2 @+ 1
         pure (instrValue, instrValue1)
       liftIO $ do
         print values
@@ -127,6 +115,9 @@ testNew = do
         print values
   performGC
   pure ()
+
+
+
 
 -- data TraceTime
 --   = MicroSeconds Integer

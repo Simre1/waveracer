@@ -1,7 +1,7 @@
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE RecursiveDo #-}
 
-module Waveracer.Raw where
+module Waveracer.Internal where
 
 -- (Waveform, Signal, loadFile, lookupSignal, loadSignals, getTimes, getSignal)
 
@@ -53,7 +53,7 @@ data Waveform = Waveform
 
 data VarRef = VarRef CUIntPtr deriving (Eq, Show, Ord)
 
-data Signal = Signal {offset :: Int, varRef :: VarRef} deriving (Eq, Show, Ord)
+data Signal = Signal {varRef :: VarRef} deriving (Eq, Show, Ord)
 
 newtype TimeIndex = TimeIndex Int deriving (Eq, Show, Ord)
 
@@ -116,7 +116,7 @@ unloadVars waveform signals = do
     void $ putStrLn "Unloading done"
 
 lookupSignal :: Waveform -> String -> IO (Maybe Signal)
-lookupSignal waveform name = fmap (Signal 0) <$> lookupVar waveform name
+lookupSignal waveform name = fmap Signal <$> lookupVar waveform name
 
 lookupActiveVar :: Waveform -> String -> IO (Maybe VarRef)
 lookupActiveVar waveform string = do
@@ -400,15 +400,8 @@ loadQueuedSignals waveform = do
 enqueueVar :: Waveform -> VarRef -> IO ()
 enqueueVar waveform ref = modifyIORef' waveform.loadQueue (S.insert ref)
 
-getSignal :: Waveform -> Signal -> TimeIndex -> S.Set TimeIndex -> IO SignalValue
-getSignal waveform (Signal offset (VarRef ref)) timeIndex@(TimeIndex rawIndex) indices
-  | offset > 0 = case S.lookupGT timeIndex indices of
-      Just newTimeIndex -> getSignal waveform (Signal (pred offset) (VarRef ref)) newTimeIndex indices
-      Nothing -> pure $ ErrorValue $ "Cannot step forwards for time index " ++ show timeIndex
-  | offset < 0 = case S.lookupLT timeIndex indices of
-      Just newTimeIndex -> getSignal waveform (Signal (succ offset) (VarRef ref)) newTimeIndex indices
-      Nothing -> pure $ ErrorValue $ "Cannot step backwards for time index " ++ show timeIndex
-  | otherwise = do
+getSignal :: Waveform -> Signal -> TimeIndex -> IO SignalValue
+getSignal waveform (Signal (VarRef ref)) (TimeIndex rawIndex) =
       withForeignPtr waveform.fPtr $ \ptr -> do
         SignalResult signalType word dataPtr count <- getVarRaw ptr ref (fromIntegral rawIndex) >>= peek
         case signalType of

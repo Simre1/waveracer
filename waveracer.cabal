@@ -14,7 +14,10 @@ extra-doc-files:    CHANGELOG.md
 -- extra-source-files:
 
 common common
-    ghc-options: -Wall
+    ghc-options:
+        -Wall
+    extra-libraries: wellen_binding
+    extra-lib-dirs: /home/simon/Projects/waveracer
     build-depends:
       base ^>=4.20.0.0,
       transformers,
@@ -32,19 +35,26 @@ common common
       DuplicateRecordFields
       NoFieldSelectors
       OverloadedRecordDot
-
+    
 library
     import:           common
     exposed-modules:
         Waveracer
     other-modules:
-        Waveracer.Raw
+        Waveracer.Internal
     hs-source-dirs:   src
     includes: wellen-binding.h
 
+executable sonic
+    import:           common
+    hs-source-dirs:   executables
+    main-is:          Sonic.hs
+    build-depends:
+        waveracer,
+        aeson
+
 test-suite waveracer-test
     import:           common
-    default-language: GHC2024
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
     main-is:          Main.hs
