@@ -16,6 +16,8 @@ extra-doc-files:    CHANGELOG.md
 common common
     ghc-options:
         -Wall
+        -fprof-auto
+        -O2
     extra-libraries: wellen_binding
     extra-lib-dirs: /home/simon/Projects/waveracer
     build-depends:
@@ -35,6 +37,7 @@ common common
       DuplicateRecordFields
       NoFieldSelectors
       OverloadedRecordDot
+      StrictData
     
 library
     import:           common

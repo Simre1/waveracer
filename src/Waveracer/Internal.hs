@@ -1,5 +1,7 @@
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RecursiveDo #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Waveracer.Internal where
 
@@ -18,6 +20,9 @@ import Data.Map qualified as M
 import Data.Maybe (catMaybes, fromJust, fromMaybe)
 import Data.Ratio
 import Data.Set qualified as S
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as T
 import Data.Text.Internal.Read
 import Data.Traversable (for)
 import Data.Vector.Storable qualified as V
@@ -39,7 +44,7 @@ foreign import ccall safe "wellen-binding.h load_vars" loadVarsRaw :: Ptr Wavefo
 
 foreign import ccall unsafe "wellen-binding.h unload_vars" unloadVarsRaw :: Ptr Waveform -> Ptr CUIntPtr -> CUIntPtr -> IO ()
 
-foreign import ccall unsafe "wellen-binding.h lookup_var" lookupVarRaw :: Ptr Waveform -> CString -> IO (CIntPtr)
+foreign import ccall unsafe "wellen-binding.h lookup_var" lookupVarRaw :: Ptr Waveform -> Ptr Text -> CUIntPtr -> IO (CIntPtr)
 
 foreign import ccall unsafe "wellen-binding.h get_var" getVarRaw :: Ptr Waveform -> CUIntPtr -> Word32 -> IO (Ptr (SignalResult))
 
@@ -47,9 +52,14 @@ foreign import ccall unsafe "wellen-binding.h get_times" getTimesRaw :: Ptr Wave
 
 foreign import ccall unsafe "wellen-binding.h get_timescale" getTimescaleRaw :: Ptr Waveform -> IO CIntPtr
 
+withUtf8 :: Text -> (Ptr Text -> Int -> IO a) -> IO a
+withUtf8 txt action =
+  let bs = T.encodeUtf8 txt
+   in BS.unsafeUseAsCString bs (\ptr -> action (castPtr ptr) (BS.length bs))
+
 data Waveform = Waveform
   { fPtr :: ForeignPtr Waveform,
-    activeVars :: IORef (M.Map String (Weak VarRef)),
+    activeVars :: IORef (M.Map Text (Weak VarRef)),
     loadQueue :: IORef (S.Set VarRef)
   }
 
@@ -142,10 +152,10 @@ unloadVars waveform signals = do
       unloadVarsRaw ptr signalsPtr (fromIntegral count)
     void $ putStrLn "Unloading done"
 
-lookupSignal :: Waveform -> String -> IO (Maybe Signal)
+lookupSignal :: Waveform -> Text -> IO (Maybe Signal)
 lookupSignal waveform name = fmap Signal <$> lookupVar waveform name
 
-lookupActiveVar :: Waveform -> String -> IO (Maybe VarRef)
+lookupActiveVar :: Waveform -> Text -> IO (Maybe VarRef)
 lookupActiveVar waveform string = do
   activeVars <- readIORef waveform.activeVars
   case M.lookup string activeVars of
@@ -158,15 +168,15 @@ lookupActiveVar waveform string = do
           pure Nothing
         Just var -> pure $ Just var
 
-lookupVar :: Waveform -> String -> IO (Maybe VarRef)
+lookupVar :: Waveform -> Text -> IO (Maybe VarRef)
 lookupVar waveform name = do
   activeVar <- lookupActiveVar waveform name
   case activeVar of
     Just var -> pure $ Just var
     Nothing -> do
-      withCString name $ \cString -> do
+      withUtf8 name $ \utf8 size -> do
         withForeignPtr waveform.fPtr $ \ptr -> do
-          cInt <- lookupVarRaw ptr cString
+          cInt <- lookupVarRaw ptr utf8 (fromIntegral size)
           if cInt >= 0
             then do
               let var = VarRef (fromIntegral cInt)
@@ -188,7 +198,6 @@ getTraceTime waveform (TimeIndex ti) = do
   scale <- getTimescale waveform
   withForeignPtr waveform.fPtr $ \ptr -> do
     CSlice times count <- getTimesRaw ptr >>= peek
-    print (ti, count)
     when (ti >= fromIntegral count) $
       fail "That time index is too great"
     time <- peekByteOff times (ti * sizeOf (undefined :: Word64))
@@ -270,21 +279,23 @@ instance Storable SignalResult where
     pokeByteOff ptr (sizeOf (undefined :: CIntPtr) + sizeOf (undefined :: Word64) + sizeOf (undefined :: Ptr Word8)) l
 
 data SignalValue
-  = ErrorValue String
-  | BitsValue States Int BS.ByteString
-  | StringValue BS.ByteString
-  | RealValue Double
+  = ErrorValue !String
+  | BitstringValue !States !Int !BS.ByteString
+  | ByteStringValue !BS.ByteString
+  | RealValue !Double
 
 -- TODO: wellen does some special handling of the first byte
 -- Maybe there is some special situation which can happen
 instance Show SignalValue where
   show (ErrorValue reason) = "ErrorValue " ++ reason
-  show (BitsValue states count bs) = decodeByteString states count bs
-  show (StringValue str) = BS8.unpack str
+  show (BitstringValue states count bs) = T.unpack $ decodeByteString states count bs
+  show (ByteStringValue str) = BS8.unpack str
   show (RealValue value) = show value
 
 instance Num SignalValue where
-  fromInteger n = fromJust $ makeBitsValue Two $ showIntAtBase 2 intToDigit n ""
+  fromInteger n =
+    let str = showIntAtBase 2 intToDigit n ""
+     in BitstringValue Two (length str) (fromJust $ encodeByteString Two str)
   sv1 + sv2 = performBinaryOp Plus sv1 sv2
   sv1 - sv2 = performBinaryOp Minus sv1 sv2
   sv1 * sv2 = performBinaryOp Multiply sv1 sv2
@@ -318,7 +329,7 @@ intOrDoubleToSignalValue (Left int) = fromIntegral int
 intOrDoubleToSignalValue (Right double) = RealValue double
 
 performUnaryOp :: UnaryOp -> SignalValue -> SignalValue
-performUnaryOp op (StringValue str) = ErrorValue "Cannot perform arithmetic on strings"
+performUnaryOp op (ByteStringValue str) = ErrorValue "Cannot perform arithmetic on strings"
 performUnaryOp op (ErrorValue reason) = (ErrorValue reason)
 performUnaryOp op (RealValue double) = case op of
   Signum ->
@@ -328,7 +339,7 @@ performUnaryOp op (RealValue double) = case op of
       | otherwise -> 0
   Abs -> RealValue (abs double)
   Negate -> RealValue (negate double)
-performUnaryOp op sv@(BitsValue {}) =
+performUnaryOp op sv@(BitstringValue {}) =
   fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
     n <- signalValueToInt sv
     pure $ fromIntegral $ case op of
@@ -339,24 +350,24 @@ performUnaryOp op sv@(BitsValue {}) =
 performBinaryOp :: BinaryOp -> SignalValue -> SignalValue -> SignalValue
 performBinaryOp _ (ErrorValue reason) _ = ErrorValue reason
 performBinaryOp _ _ (ErrorValue reason) = ErrorValue reason
-performBinaryOp _ (StringValue _) _ = ErrorValue "Cannot perform arithmetic on strings"
-performBinaryOp _ _ (StringValue _) = ErrorValue "Cannot perform arithmetic on strings"
-performBinaryOp arop sv1@(BitsValue {}) sv2@(BitsValue {}) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
+performBinaryOp _ (ByteStringValue _) _ = ErrorValue "Cannot perform arithmetic on strings"
+performBinaryOp _ _ (ByteStringValue _) = ErrorValue "Cannot perform arithmetic on strings"
+performBinaryOp arop sv1@(BitstringValue {}) sv2@(BitstringValue {}) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
   n1 <- signalValueToInt sv1
   n2 <- signalValueToInt sv2
   pure $ intOrDoubleToSignalValue $ execArithmeticOp arop (Left n1) (Left n2)
-performBinaryOp arop (RealValue n1) sv2@(BitsValue {}) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
+performBinaryOp arop (RealValue n1) sv2@(BitstringValue {}) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
   n2 <- signalValueToInt sv2
   pure $ intOrDoubleToSignalValue $ execArithmeticOp arop (Right n1) (Left n2)
-performBinaryOp arop sv1@(BitsValue {}) (RealValue n2) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
+performBinaryOp arop sv1@(BitstringValue {}) (RealValue n2) = fromMaybe (ErrorValue "Can only perform arithmetic on fully known strings") $ do
   n1 <- signalValueToInt sv1
   pure $ intOrDoubleToSignalValue $ execArithmeticOp arop (Left n1) (Right n2)
 performBinaryOp arop (RealValue n1) (RealValue n2) =
   intOrDoubleToSignalValue $ execArithmeticOp arop (Right n1) (Right n2)
 
-decodeByteString :: States -> Int -> BS.ByteString -> String
+decodeByteString :: States -> Int -> BS.ByteString -> Text
 decodeByteString states count bs =
-  foldr (\i s -> makeChar i : s) "" [byte0MissingDigits .. byte0MissingDigits + count - 1]
+  T.pack $ foldl' (\s i -> makeChar i : s) "" [byte0MissingDigits + count - 1, byte0MissingDigits + count - 2 .. byte0MissingDigits]
   where
     digits = digitsPerByte states
     bitsN = bitsForDigit states
@@ -403,17 +414,43 @@ encodeByteString states string = do
           (w8 :) <$> makeWord8s rest
         else makeWord8s $ xs ++ replicate (digits - length xs) '0'
 
-signalValueToInt :: SignalValue -> Maybe Int
-signalValueToInt bitsValue@(BitsValue states count bs) = do
-  let bitString = show bitsValue
-  guard $ all (`elem` ("01" :: String)) bitString
-  pure $ readBinary bitString
+decodeByteStringToInt :: States -> Int -> BS.ByteString -> Maybe Int
+decodeByteStringToInt states count bs =
+  foldl'
+    (\number i -> (+) <$> number <*> getValue i)
+    (pure 0)
+    [byte0MissingDigits .. byte0MissingDigits + count - 1]
   where
-    readBinary = fst . head . readInt 2 (const True) digitToInt
+    digits = digitsPerByte states
+    bitsN = bitsForDigit states
+    lookup = stateLookup states
+    mask = case states of
+      Two -> 0b1
+      Four -> 0b11
+      Nine -> 0b1111
+    -- The leftmost byte might not contain the full N bits.
+    -- Therefore, the left side might be 0 and we need to adapt the offset
+    byte0MissingDigits =
+      let x = (count - ((count `quot` digits) * digits))
+       in if x == 0 then 0 else digits - x
+    getValue i =
+      let word = BS.index bs (i `quot` digits)
+          offset = bitsN * (digits - 1 - (i `mod` digits))
+       in ((2 ^ i) *) <$> case lookup  V.! fromIntegral (shiftR word offset .&. mask) of
+            '0' -> Just 0
+            '1' -> Just 1
+            _ -> Nothing
+
+signalValueToInt :: SignalValue -> Maybe Int
+signalValueToInt bitsValue@(BitstringValue states count bs) = decodeByteStringToInt states count bs
 signalValueToInt _ = Nothing
 
 instance Eq SignalValue where
-  sv1 == sv2 = show sv1 == show sv2
+  (BitstringValue states1 count1 bs1) == (BitstringValue states2 count2 bs2) =
+    if states1 == states2 && count1 == count2
+      then bs1 == bs2
+      else decodeByteString states1 count1 bs1 == decodeByteString states2 count2 bs2
+  sv1 == sv2 = (sv1 `compare` sv2) == EQ
 
 instance Ord SignalValue where
   sv1 `compare` sv2 = show sv1 `compare` show sv2
@@ -429,10 +466,10 @@ bitsForDigit states = case states of
 digitsPerByte :: States -> Int
 digitsPerByte states = 8 `quot` bitsForDigit states
 
-makeBitsValue :: States -> String -> Maybe SignalValue
-makeBitsValue states string = do
-  bs <- encodeByteString states string
-  pure $ BitsValue states (length string) bs
+-- makeBitstringValue :: States -> String -> Maybe SignalValue
+-- makeBitstringValue states string = do
+--   bs <- encodeByteString states string
+--   pure $ BitstringValue states (length string) bs
 
 isTrue :: SignalValue -> Bool
 isTrue sv = case show sv of
@@ -460,16 +497,16 @@ getSignal waveform (Signal (VarRef ref)) (TimeIndex rawIndex) =
       -1 -> pure (ErrorValue "The signal does not have a value yet")
       0 -> do
         bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
-        pure $ BitsValue Two (fromIntegral word) bs
+        pure $ BitstringValue Two (fromIntegral word) bs
       1 -> do
         bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
-        pure $ BitsValue Four (fromIntegral word) bs
+        pure $ BitstringValue Four (fromIntegral word) bs
       2 -> do
         bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
-        pure $ BitsValue Nine (fromIntegral word) bs
+        pure $ BitstringValue Nine (fromIntegral word) bs
       3 -> do
         bs <- BS.unsafePackCStringFinalizer dataPtr (fromIntegral count) (touchForeignPtr waveform.fPtr)
-        pure $ StringValue bs
+        pure $ ByteStringValue bs
       4 -> pure $ RealValue $ castWord64ToDouble word
       x -> error $ "Unsupported signal value: " ++ show x
 
@@ -478,6 +515,48 @@ stateLookup states = V.fromList $ case states of
   Two -> "01"
   Four -> "01xz"
   Nine -> "01xzhuwl-"
+
+determineEncoding :: String -> Maybe States
+determineEncoding str
+  | all (`V.elem` (stateLookup Two)) str = pure Two
+  | all (`V.elem` (stateLookup Four)) str = pure Four
+  | all (`V.elem` (stateLookup Nine)) str = pure Nine
+  | otherwise = Nothing
+
+makeBitstringValue :: String -> Maybe SignalValue
+makeBitstringValue string = do
+  states <- determineEncoding string
+  BitstringValue states (length string) <$> encodeByteString states string
+
+pattern BitsValue :: Text -> SignalValue
+pattern BitsValue string <- (extractBitstring -> Just string)
+
+pattern StringValue :: Text -> SignalValue
+pattern StringValue string <- (extractString -> Just string)
+  where
+    StringValue string = ByteStringValue $ T.encodeUtf8 string
+
+{-# COMPLETE BitsValue, ErrorValue, ByteStringValue, RealValue #-}
+
+{-# COMPLETE BitsValue, ErrorValue, StringValue, RealValue #-}
+
+{-# COMPLETE BitstringValue, ErrorValue, ByteStringValue, RealValue #-}
+
+{-# COMPLETE BitstringValue, ErrorValue, StringValue, RealValue #-}
+
+pattern IntValue :: Int -> SignalValue
+pattern IntValue int <- (signalValueToInt -> Just int)
+  where
+    IntValue int = fromIntegral int
+
+extractString :: SignalValue -> Maybe Text
+extractString (ByteStringValue bs) = Just $ T.decodeUtf8 bs
+extractString _ = Nothing
+
+extractBitstring :: SignalValue -> Maybe Text
+extractBitstring (BitstringValue states count bs) =
+  pure $ decodeByteString states count bs
+extractBitstring _ = Nothing
 
 reverseStateLookup :: States -> M.Map Char Word8
 reverseStateLookup states = M.fromList $ zip (V.toList $ stateLookup states) [0 ..]

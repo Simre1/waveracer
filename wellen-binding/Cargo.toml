@@ -6,5 +6,8 @@ edition = "2024"
 [lib]
 crate-type=["cdylib"]
 
+[patch.crates-io]
+fst-reader = { path = "/home/simon/Projects/fst-reader" }
+
 [dependencies]
 wellen="0.15.0"

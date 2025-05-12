@@ -1,12 +1,41 @@
-module Waveracer (Waveform, loadFile, Trace, runTrace, Signal, load, loadMany, loadAsMap, (@+), (@-), findIndices, sampleAt, sampleOn, Inspect, runInspect, inspect, SignalValue) where
+{-# LANGUAGE PatternSynonyms #-}
+module Waveracer
+  ( Waveform,
+    loadFile,
+    Trace,
+    runTrace,
+    Signal,
+    load,
+    loadMany,
+    loadAsMap,
+    (@+),
+    (@-),
+    findIndices,
+    sampleAt,
+    sampleOn,
+    Inspect,
+    runInspect,
+    inspect,
+    SignalValue(..),
+    pattern BitsValue,
+    pattern StringValue,
+    pattern IntValue,
+    inspectTime,
+    TraceTime (..),
+    Timescale (..),
+    TimeUnit (..),
+  )
+where
 
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
-import Data.Map qualified as M
+import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import System.Mem
 import Waveracer.Internal
+import Data.Text (Text)
+import qualified Data.Text as T
 
 data TraceEnv = TraceEnv
   { waveform :: Waveform,
@@ -56,9 +85,9 @@ runTrace waveform (Trace m) = do
 (@+) (Inspect m) offset = do
   indices <- Inspect $ lift $ getCurrentTimeIndices
   currentTimeIndex <- getCurrentTimeIndex
-  Inspect $ lift $ go indices currentTimeIndex offset 
+  Inspect $ lift $ go indices currentTimeIndex offset
   where
-    go indices timeIndex offset 
+    go indices timeIndex offset
       | offset > 0 = case S.lookupGT timeIndex indices of
           Just newTimeIndex -> go indices newTimeIndex (pred offset)
           Nothing -> pure $ ErrorValue $ "Cannot step forwards for time index " ++ show timeIndex
@@ -70,18 +99,18 @@ runTrace waveform (Trace m) = do
 (@-) :: Inspect SignalValue -> Int -> Inspect SignalValue
 (@-) inspect offset = inspect @+ (-offset)
 
-load :: String -> Trace Signal
+load :: Text -> Trace Signal
 load string = do
   env <- Trace ask
   maybeVarRef <- liftIO $ lookupSignal env.waveform string
   case maybeVarRef of
     Just a -> pure a
-    Nothing -> fail $ "Signal " ++ string ++ " not found"
+    Nothing -> fail $ "Signal " ++ T.unpack string ++ " not found"
 
-loadMany :: (Traversable t) => t String -> Trace (t Signal)
+loadMany :: (Traversable t) => t Text -> Trace (t Signal)
 loadMany = traverse load
 
-loadAsMap :: [String] -> Trace (M.Map String Signal)
+loadAsMap :: [Text] -> Trace (M.Map Text Signal)
 loadAsMap strings = do
   signals <- loadMany strings
   pure $ M.fromList $ zip strings signals
@@ -90,13 +119,13 @@ inspect :: Signal -> Inspect SignalValue
 inspect signal = do
   waveform <- Inspect $ lift $ getWaveform
   ti <- getCurrentTimeIndex
-  liftIO $ getSignal waveform signal ti 
+  liftIO $ getSignal waveform signal ti
 
 inspectTime :: Inspect TraceTime
 inspectTime = do
   waveform <- Inspect $ lift $ getWaveform
   ti <- getCurrentTimeIndex
-  liftIO $ getTraceTime waveform ti 
+  liftIO $ getTraceTime waveform ti
 
 testNew :: IO ()
 testNew = do
@@ -122,9 +151,6 @@ testNew = do
         print values
   performGC
   pure ()
-
-
-
 
 -- data TraceTime
 --   = MicroSeconds Integer

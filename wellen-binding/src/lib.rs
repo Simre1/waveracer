@@ -1,5 +1,40 @@
-use std::{ffi::*, ops::Deref, panic, ptr};
-use wellen::{Hierarchy, SignalRef, SignalValue, Timescale, TimescaleUnit, Var, VarRef, simple::*};
+#![feature(inherent_str_constructors)]
+
+use std::{collections::HashMap, ffi::*, ops::Deref, panic, ptr};
+use wellen::{
+    Hierarchy, LoadOptions, SignalRef, SignalValue, Timescale, TimescaleUnit, Var, VarRef,
+    simple::*,
+};
+
+#[repr(C)]
+pub struct CSlice<S> {
+    ptr: *const S,
+    length: usize,
+}
+
+#[repr(C)]
+pub struct SignalResult {
+    signal_type: isize,
+    word: u64,
+    bytes: *const u8,
+    length: usize,
+}
+
+#[repr(C)]
+pub struct Manager {
+    waveform: Waveform,
+    name_cache: HashMap<String, VarRef>,
+}
+
+impl<'a> Manager {
+    fn into_pointer(self) -> *mut c_void {
+        return Box::into_raw(Box::new(self)) as *mut c_void;
+    }
+
+    unsafe fn from_pointer(ptr: *mut c_void) -> &'a mut Self {
+        return &mut *(ptr.cast());
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn load_file(c_str: *const c_char) -> *mut c_void {
@@ -7,14 +42,26 @@ pub extern "C" fn load_file(c_str: *const c_char) -> *mut c_void {
         let c_str = CStr::from_ptr(c_str);
         match c_str.to_str() {
             Ok(path) => {
-                let result = panic::catch_unwind(|| match read(path) {
-                    Result::Ok(waveform) => Result::Ok(waveform),
-                    Result::Err(err) => Result::Err(err),
+                let result = panic::catch_unwind(|| {
+                    match read_with_options(
+                        path,
+                        &LoadOptions {
+                            multi_thread: true,
+                            remove_scopes_with_empty_name: true,
+                        },
+                    ) {
+                        Result::Ok(waveform) => Result::Ok(waveform),
+                        Result::Err(err) => Result::Err(err),
+                    }
                 });
                 match result {
                     Result::Ok(maybe_waveform) => match maybe_waveform {
                         Result::Ok(waveform) => {
-                            return Box::into_raw(Box::new(waveform)) as *mut c_void;
+                            let manager = Manager {
+                                waveform,
+                                name_cache: HashMap::new(),
+                            };
+                            return manager.into_pointer();
                         }
                         Result::Err(err) => {
                             eprintln!("Loading error: {err}");
@@ -33,16 +80,17 @@ pub extern "C" fn load_file(c_str: *const c_char) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn free_waveform(waveform_ptr: *mut c_void) {
+pub extern "C" fn free_waveform(manager_ptr: *mut c_void) {
     unsafe {
-        drop(Box::from_raw(waveform_ptr));
+        drop(Box::from_raw(manager_ptr));
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn load_vars(waveform_ptr: *mut c_void, vars_ptr: *const usize, count: usize) {
+pub extern "C" fn load_vars(manager_ptr: *mut c_void, vars_ptr: *const usize, count: usize) {
     unsafe {
-        let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
+        let manager = Manager::from_pointer(manager_ptr);
+        let waveform = &mut manager.waveform;
         let hierarchy = waveform.hierarchy();
 
         let vars = std::slice::from_raw_parts(vars_ptr, count);
@@ -58,9 +106,10 @@ pub extern "C" fn load_vars(waveform_ptr: *mut c_void, vars_ptr: *const usize, c
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn unload_vars(waveform_ptr: *mut c_void, vars_ptr: *const usize, count: usize) {
+pub extern "C" fn unload_vars(manager_ptr: *mut c_void, vars_ptr: *const usize, count: usize) {
     unsafe {
-        let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
+        let manager = Manager::from_pointer(manager_ptr);
+        let waveform = &mut manager.waveform;
         let hierarchy = waveform.hierarchy();
 
         assert_eq!(vars_ptr as usize % std::mem::align_of::<usize>(), 0);
@@ -81,16 +130,10 @@ pub extern "C" fn unload_vars(waveform_ptr: *mut c_void, vars_ptr: *const usize,
     }
 }
 
-#[repr(C)]
-pub struct CSlice<S> {
-    ptr: *const S,
-    length: usize,
-}
-
 // #[unsafe(no_mangle)]
-// pub extern "C" fn get_all_signals(waveform_ptr: *mut c_void) -> CSlice<CString> {
+// pub extern "C" fn get_all_signals(manager_ptr: *mut c_void) -> CSlice<CString> {
 //     unsafe {
-//         let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
+//         let waveform: &mut Waveform = &mut *(manager_ptr.cast());
 //         let hierarchy = waveform.hierarchy();
 //         let vars: Vec<String> = hierarchy
 //             .iter_vars()
@@ -105,37 +148,62 @@ pub struct CSlice<S> {
 // }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn lookup_var(waveform_ptr: *mut c_void, name_ptr: *const c_char) -> isize {
+pub extern "C" fn lookup_var(manager_ptr: *mut c_void, name_ptr: *const u8, count: usize) -> isize {
     unsafe {
-        let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
+        let manager = Manager::from_pointer(manager_ptr);
+        let waveform = &mut manager.waveform;
+        let name_cache = &mut manager.name_cache;
         let hierarchy = waveform.hierarchy();
-        let c_str = CStr::from_ptr(name_ptr);
+        let name_bytes = std::slice::from_raw_parts(name_ptr, count);
+        let signal_name = str::from_utf8_unchecked(name_bytes);
 
-        match c_str.to_str() {
-            Ok(signal_name) => {
+        let cached_ref = name_cache.get(signal_name);
+
+        match cached_ref {
+            Some(cached) => return cached.index() as isize,
+            None => {
                 let parts: Vec<&str> = signal_name.split('.').collect();
                 let name = parts[parts.len() - 1];
                 let path = &parts[0..parts.len() - 1];
-                let found = hierarchy.lookup_var(path, &name);
-                match found {
-                    Some(var_ref) => {
-                        return var_ref.index() as isize;
+                let maybe_scope_ref = hierarchy.lookup_scope(path);
+                match maybe_scope_ref {
+                    Some(scope_ref) => {
+                        let scope = &hierarchy[scope_ref];
+                        let found = scope
+                            .vars(hierarchy)
+                            .find(|x| name == hierarchy[*x].name(hierarchy));
+
+                        match found {
+                            Some(var_ref) => {
+                                for var_ref in scope.vars(hierarchy) {
+                                    let var = &hierarchy[var_ref];
+                                    name_cache.insert(var.full_name(hierarchy), var_ref);
+                                }
+                                return var_ref.index() as isize;
+                            }
+                            None => return -1,
+                        }
                     }
                     None => return -1,
                 }
             }
-            Err(err) => {
-                eprintln!("Invalid signal name: {err}");
-                return -1;
-            }
         }
+
+        // let found = hierarchy.lookup_var(path, &name);
+        // match found {
+        //     Some(var_ref) => {
+        //         return var_ref.index() as isize;
+        //     }
+        //     None => return -1,
+        // }
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn get_times(waveform_ptr: *mut c_void) -> *const CSlice<u64> {
+pub extern "C" fn get_times(manager_ptr: *mut c_void) -> *const CSlice<u64> {
     unsafe {
-        let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
+        let manager = Manager::from_pointer(manager_ptr);
+        let waveform = &mut manager.waveform;
         let times = waveform.time_table();
         let c_slice = CSlice {
             ptr: times.as_ptr(),
@@ -146,9 +214,10 @@ pub extern "C" fn get_times(waveform_ptr: *mut c_void) -> *const CSlice<u64> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn get_timescale(waveform_ptr: *mut c_void) -> u64 {
+pub extern "C" fn get_timescale(manager_ptr: *mut c_void) -> u64 {
     unsafe {
-        let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
+        let manager = Manager::from_pointer(manager_ptr);
+        let waveform = &mut manager.waveform;
         match waveform.hierarchy().timescale() {
             None => return 0,
             Some(Timescale { factor, unit }) => {
@@ -167,22 +236,15 @@ pub extern "C" fn get_timescale(waveform_ptr: *mut c_void) -> u64 {
     }
 }
 
-#[repr(C)]
-pub struct SignalResult {
-    signal_type: isize,
-    word: u64,
-    bytes: *const u8,
-    length: usize,
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn get_var(
-    waveform_ptr: *mut c_void,
+    manager_ptr: *mut c_void,
     var_index: usize,
     time_index: u32,
 ) -> *const SignalResult {
     unsafe {
-        let waveform: &mut Waveform = &mut *(waveform_ptr.cast());
+        let manager = Manager::from_pointer(manager_ptr);
+        let waveform = &mut manager.waveform;
         let hierarchy = waveform.hierarchy();
         let var_ref = VarRef::from_index(var_index).unwrap();
         let signal = waveform

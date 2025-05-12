@@ -54,8 +54,6 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "fst-reader"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f108c330236b622bd8c495197b10f4e7a0855a86d71da569f1b8b87bc8a5f7e"
 dependencies = [
  "lz4_flex",
  "miniz_oxide",
