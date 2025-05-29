@@ -7,7 +7,7 @@ edition = "2024"
 crate-type=["cdylib"]
 
 [patch.crates-io]
-fst-reader = { path = "/home/simon/Projects/fst-reader" }
+fst-reader = { git="https://github.com/Simre1/fst-reader.git"}
 
 [dependencies]
 wellen="0.15.0"

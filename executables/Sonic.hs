@@ -3,19 +3,20 @@ import Control.Monad.Trans.Class
 import Control.Monad.Trans.State
 import Data.Aeson
 import Data.ByteString.Lazy.Char8 qualified as BL
+import Data.Foldable (for_)
 import Data.Map qualified as M
+import Data.Maybe (fromJust)
+import Data.Sequence qualified as S
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Traversable
 import GHC.Generics (Generic)
 import Waveracer
 import Prelude hiding (log)
-import qualified Data.Sequence as S
-import Data.Foldable (for_)
 
 main :: IO ()
 main = do
-  wf <- loadFile "/home/simon/Downloads/new-ics-edu-rv32i-sc-cd87a3b1dde9.fst"
+  wf <- loadWaveformFile "/home/simon/Downloads/new-ics-edu-rv32i-sc-cd87a3b1dde9.fst"
 
   values <- runTrace wf $ do
     instr <- load "testbench.dut.Instr"
@@ -48,21 +49,21 @@ main = do
         log "writedata" "testbench.dut.dp.WriteData"
         for_ [0 .. 31] $ \i -> do
           log ("x" ++ show i) ("testbench.ram_regs." <> T.pack (show i))
-        logExpression "realtime" (IntValue . fromIntegral . (.time) <$> inspectTime)
+        logExpression "realtime" (encodeInt . fromIntegral . (.time) <$> inspectTime)
 
     memorySignals <- loadMany $ M.fromList [(i, "testbench.ram_dmem." <> T.pack (show i)) | i <- [0 .. 2 ^ 14 - 1]]
 
     let condition = do
           clkValue <- inspect clk
           resetValue <- inspect reset
-          pure $ clkValue == 1 && resetValue /= 1
+          pure $ decodeInt clkValue == Just 1 && decodeInt resetValue /= Just 1
 
     sampleOn condition $
       traceProcessor $
         Processor
           { instruction = inspect instr,
-            stages = stages,
-            memory = M.filter (\case (IntValue x) -> x /= 0; _ -> True) <$> traverse inspect memorySignals
+            stages = fmap (fmap (fmap (fromJust . decodeBitString))) stages,
+            memory = M.filter (/= 0) <$> traverse (fmap (fromJust . decodeInt) . inspect) memorySignals
           }
 
   printJSON $ toJSON values
@@ -109,9 +110,9 @@ defineStages :: DefineStages a -> Trace (a, M.Map String (M.Map String (Inspect 
 defineStages (DefineStages m) = runStateT m M.empty
 
 data Processor f = Processor
-  { stages :: M.Map String (M.Map String (f SignalValue)),
+  { stages :: M.Map String (M.Map String (f Text)),
     instruction :: f SignalValue,
-    memory :: f (M.Map Int SignalValue)
+    memory :: f (M.Map Int Int)
   }
   deriving (Generic)
 
@@ -135,4 +136,4 @@ printJSON :: Value -> IO ()
 printJSON val = BL.putStrLn (encode val)
 
 mergeMaps :: (Ord k) => [M.Map k a] -> M.Map k [a]
-mergeMaps = foldl' (M.unionWith (<>)) M.empty . map (M.map (:[]))
+mergeMaps = foldl' (M.unionWith (<>)) M.empty . map (M.map (: []))

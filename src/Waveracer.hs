@@ -1,7 +1,8 @@
 {-# LANGUAGE PatternSynonyms #-}
+
 module Waveracer
   ( Waveform,
-    loadFile,
+    loadWaveformFile,
     Trace,
     runTrace,
     Signal,
@@ -16,10 +17,18 @@ module Waveracer
     Inspect,
     runInspect,
     inspect,
-    SignalValue(..),
-    pattern BitsValue,
-    pattern StringValue,
-    pattern IntValue,
+    SignalValue (..),
+    decodeInt,
+    decodeInteger,
+    decodeWord,
+    decodeIntegral,
+    decodeText,
+    decodeDouble,
+    decodeBitString,
+    encodeBitString,
+    encodeInt,
+    encodeText,
+    encodeDouble,
     inspectTime,
     TraceTime (..),
     Timescale (..),
@@ -32,10 +41,10 @@ import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
+import Data.Text (Text)
+import Data.Text qualified as T
 import System.Mem
 import Waveracer.Internal
-import Data.Text (Text)
-import qualified Data.Text as T
 
 data TraceEnv = TraceEnv
   { waveform :: Waveform,
@@ -81,7 +90,7 @@ runTrace waveform (Trace m) = do
   timeIndices <- getTimeIndices waveform
   runReaderT m (TraceEnv waveform (S.fromList timeIndices))
 
-(@+) :: Inspect SignalValue -> Int -> Inspect SignalValue
+(@+) :: Inspect SignalValue -> Int -> Inspect (SignalValue)
 (@+) (Inspect m) offset = do
   indices <- Inspect $ lift $ getCurrentTimeIndices
   currentTimeIndex <- getCurrentTimeIndex
@@ -90,10 +99,10 @@ runTrace waveform (Trace m) = do
     go indices timeIndex offset
       | offset > 0 = case S.lookupGT timeIndex indices of
           Just newTimeIndex -> go indices newTimeIndex (pred offset)
-          Nothing -> pure $ ErrorValue $ "Cannot step forwards for time index " ++ show timeIndex
+          Nothing -> go indices timeIndex 0
       | offset < 0 = case S.lookupLT timeIndex indices of
           Just newTimeIndex -> go indices newTimeIndex (succ offset)
-          Nothing -> pure $ ErrorValue $ "Cannot step backwards for time index " ++ show timeIndex
+          Nothing -> go indices timeIndex 0
       | otherwise = runReaderT m timeIndex
 
 (@-) :: Inspect SignalValue -> Int -> Inspect SignalValue
@@ -126,34 +135,3 @@ inspectTime = do
   waveform <- Inspect $ lift $ getWaveform
   ti <- getCurrentTimeIndex
   liftIO $ getTraceTime waveform ti
-
-testNew :: IO ()
-testNew = do
-  wf <- loadFile "/home/simon/Downloads/ics-edu-rv32i-sc-2c8950d9a30b.vcd"
-  runTrace wf $ do
-    instr <- load "testbench.instr"
-    instr2 <- load "testbench.instr"
-    clk <- load "testbench.dut.clk"
-    sampleOn ((1 ==) <$> inspect clk) $ do
-      values <- runInspect $ do
-        instrValue <- inspect instr
-        instrValue1 <- inspect instr2 @+ 1
-        time <- inspectTime
-        pure (instrValue, instrValue1, time)
-      liftIO $ do
-        print values
-    liftIO performGC
-    sampleOn ((1 ==) <$> inspect clk) $ do
-      values <- runInspect $ do
-        instrValue <- inspect instr
-        pure (instrValue)
-      liftIO $ do
-        print values
-  performGC
-  pure ()
-
--- data TraceTime
---   = MicroSeconds Integer
---   | Nanoseconds Integer
---   | Picoseconds Integer
---   deriving (Show, Eq, Ord, Generic)

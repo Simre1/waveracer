@@ -54,6 +54,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "fst-reader"
 version = "0.10.2"
+source = "git+https://github.com/Simre1/fst-reader.git#3346100262520cea96816e73179cc0adf985ac25"
 dependencies = [
  "lz4_flex",
  "miniz_oxide",
